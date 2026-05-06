@@ -21,7 +21,7 @@ Claude Code 配置 (~/.claude/settings.json):
   }
 """
 
-import json, time, uuid, logging, threading, os, sys, re
+import json, time, uuid, logging, threading, os, sys, re, socket
 from datetime import datetime
 from collections import deque
 
@@ -47,6 +47,31 @@ CONFIG = {
     },
 }
 CONFIG_LOCK = threading.Lock()
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
+
+def _save_config():
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(CONFIG, f, ensure_ascii=False, indent=2)
+        logger.info(f"{_C(32)}Config saved to {CONFIG_FILE}{_RST}")
+    except Exception as e:
+        logger.warning(f"{_C(33)}Failed to save config: {e}{_RST}")
+
+
+def _load_config():
+    if not os.path.exists(CONFIG_FILE):
+        return
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        with CONFIG_LOCK:
+            for k, v in saved.items():
+                if k in CONFIG and v:
+                    CONFIG[k] = v
+        logger.info(f"{_C(32)}Config loaded from {CONFIG_FILE}{_RST}")
+    except Exception as e:
+        logger.warning(f"{_C(33)}Failed to load config: {e}{_RST}")
 
 _USE_COLOR = sys.stderr.isatty() and os.getenv("NO_COLOR") is None
 _C = lambda c: f"\033[{c}m" if _USE_COLOR else ""
@@ -166,10 +191,42 @@ def anthropic_to_openai(body: dict) -> dict:
         "stream": body.get("stream", False),
     }
 
+    if "top_k" in body:
+        result["top_k"] = body["top_k"]
+
+    tools = body.get("tools")
+    if tools:
+        oai_tools = []
+        for t in tools:
+            if isinstance(t, dict):
+                oai_tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": t.get("name", ""),
+                        "description": t.get("description", ""),
+                        "parameters": t.get("input_schema", {"type": "object", "properties": {}}),
+                    }
+                })
+        if oai_tools:
+            result["tools"] = oai_tools
+
+    tool_choice = body.get("tool_choice")
+    if tool_choice:
+        tc_type = tool_choice.get("type", "") if isinstance(tool_choice, dict) else ""
+        if tc_type == "any":
+            result["tool_choice"] = "required"
+        elif tc_type == "auto":
+            result["tool_choice"] = "auto"
+        elif tc_type == "tool":
+            name = tool_choice.get("name", "")
+            if name:
+                result["tool_choice"] = {"type": "function", "function": {"name": name}}
+
     thinking = body.get("thinking", {})
     enable_think = False
     if isinstance(thinking, dict):
-        enable_think = thinking.get("type") == "enabled"
+        ttype = thinking.get("type")
+        enable_think = ttype in ("enabled", "adaptive")
     if not enable_think:
         enable_think = cfg.get("enable_thinking", False)
 
@@ -195,6 +252,7 @@ def openai_to_anthropic(oai: dict, model: str, rid: str, input_est: int) -> dict
     msg = choice.get("message", {})
     text = msg.get("content", "") or ""
     reasoning = msg.get("reasoning_content", "")
+    tool_calls = msg.get("tool_calls") or []
 
     blocks = []
     think_tok = 0
@@ -205,7 +263,27 @@ def openai_to_anthropic(oai: dict, model: str, rid: str, input_est: int) -> dict
             "signature": f"EpR_{uuid.uuid4().hex[:40]}sig"
         })
         think_tok = estimate_tokens(reasoning)
-    blocks.append({"type": "text", "text": text})
+
+    for tc in tool_calls:
+        fn = tc.get("function", {})
+        name = fn.get("name", "")
+        arguments = fn.get("arguments", "{}")
+        if isinstance(arguments, str):
+            try:
+                inp = json.loads(arguments)
+            except json.JSONDecodeError:
+                inp = {}
+        else:
+            inp = arguments
+        blocks.append({
+            "type": "tool_use",
+            "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:24]}"),
+            "name": name,
+            "input": inp,
+        })
+
+    if text or not blocks:
+        blocks.append({"type": "text", "text": text})
 
     usage = oai.get("usage", {})
     in_tok = usage.get("prompt_tokens") or input_est
@@ -213,7 +291,8 @@ def openai_to_anthropic(oai: dict, model: str, rid: str, input_est: int) -> dict
 
     log_usage(model, in_tok, out_tok, rid, think_tok)
 
-    stop_map = {"stop": "end_turn", "length": "max_tokens", "content_filter": "end_turn"}
+    stop_map = {"stop": "end_turn", "length": "max_tokens", "content_filter": "end_turn",
+                "tool_calls": "tool_use"}
     finish = choice.get("finish_reason", "stop")
 
     return {
@@ -246,6 +325,10 @@ def stream_convert(resp, model, rid, input_est):
     think_idx = 0
     text_idx = 0
     thinking_sig = f"EpR_{uuid.uuid4().hex[:40]}sig"
+    finish_reason = "stop"
+    stream_stop_map = {"stop": "end_turn", "length": "max_tokens", "content_filter": "end_turn",
+                       "tool_calls": "tool_use"}
+    tool_data = {}
 
     yield _sse("message_start", {
         "type": "message_start",
@@ -260,77 +343,169 @@ def stream_convert(resp, model, rid, input_est):
             },
         },
     })
-    yield _sse("ping", {"type": "ping"})
 
-    for raw_line in resp.iter_lines(decode_unicode=True):
-        if not raw_line or not raw_line.startswith("data: "):
-            continue
-        payload = raw_line[6:].strip()
-        if payload == "[DONE]":
-            break
-        try:
-            chunk = json.loads(payload)
-        except json.JSONDecodeError:
-            continue
+    try:
+        raw_sock = resp.raw._fp.fp.raw._sock
+        if raw_sock:
+            raw_sock.settimeout(30)
+    except Exception:
+        pass
 
-        choices = chunk.get("choices")
-        if not choices:
-            continue
-        delta = choices[0].get("delta", {})
-        finish = choices[0].get("finish_reason")
+    buffer = ""
+    done = False
+    try:
+        for chunk in resp.iter_content(chunk_size=8192, decode_unicode=True):
+            if not chunk:
+                continue
+            buffer += chunk
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                line = line.strip()
+                if not line or not line.startswith("data: "):
+                    continue
+                payload = line[6:].strip()
+                if payload == "[DONE]":
+                    finish_reason = finish_reason or "stop"
+                    done = True
+                    break
+                try:
+                    ck = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
 
-        reasoning = delta.get("reasoning_content")
-        if reasoning:
-            if not thinking_open:
-                thinking_open = True
-                think_idx = block_idx
-                block_idx += 1
-                yield _sse("content_block_start", {
-                    "type": "content_block_start",
-                    "index": think_idx,
-                    "content_block": {
-                        "type": "thinking",
-                        "thinking": "",
-                        "signature": "",
-                    },
-                })
-            thinking_text += reasoning
-            yield _sse("content_block_delta", {
-                "type": "content_block_delta",
-                "index": think_idx,
-                "delta": {"type": "thinking_delta", "thinking": reasoning},
+                choices = ck.get("choices")
+                if not choices:
+                    continue
+                delta = choices[0].get("delta", {})
+                finish = choices[0].get("finish_reason")
+                if finish:
+                    finish_reason = finish
+
+                reasoning = delta.get("reasoning_content")
+                if reasoning:
+                    if not thinking_open:
+                        thinking_open = True
+                        think_idx = block_idx
+                        block_idx += 1
+                        yield _sse("content_block_start", {
+                            "type": "content_block_start",
+                            "index": think_idx,
+                            "content_block": {
+                                "type": "thinking",
+                                "thinking": "",
+                                "signature": "",
+                            },
+                        })
+                    thinking_text += reasoning
+                    yield _sse("content_block_delta", {
+                        "type": "content_block_delta",
+                        "index": think_idx,
+                        "delta": {"type": "thinking_delta", "thinking": reasoning},
+                    })
+
+                text = delta.get("content")
+                if text:
+                    if thinking_open:
+                        yield _sse("content_block_delta", {
+                            "type": "content_block_delta",
+                            "index": think_idx,
+                            "delta": {"type": "signature_delta", "signature": thinking_sig},
+                        })
+                        yield _sse("content_block_stop", {
+                            "type": "content_block_stop", "index": think_idx,
+                        })
+                        thinking_open = False
+                    if not content_started:
+                        content_started = True
+                        text_idx = block_idx
+                        block_idx += 1
+                        yield _sse("content_block_start", {
+                            "type": "content_block_start",
+                            "index": text_idx,
+                            "content_block": {"type": "text", "text": ""},
+                        })
+                    output_text += text
+                    yield _sse("content_block_delta", {
+                        "type": "content_block_delta",
+                        "index": text_idx,
+                        "delta": {"type": "text_delta", "text": text},
+                    })
+
+                tool_calls = delta.get("tool_calls")
+                if tool_calls:
+                    if thinking_open:
+                        yield _sse("content_block_delta", {
+                            "type": "content_block_delta",
+                            "index": think_idx,
+                            "delta": {"type": "signature_delta", "signature": thinking_sig},
+                        })
+                        yield _sse("content_block_stop", {
+                            "type": "content_block_stop", "index": think_idx,
+                        })
+                        thinking_open = False
+                    for tc in tool_calls:
+                        tc_idx = tc.get("index", 0)
+                        if tc_idx not in tool_data:
+                            tool_block = block_idx
+                            block_idx += 1
+                            tool_data[tc_idx] = {
+                                "block_idx": tool_block,
+                                "id": tc.get("id") or f"toolu_{uuid.uuid4().hex[:24]}",
+                                "name": "",
+                                "arguments": "",
+                                "started": False,
+                            }
+                        td = tool_data[tc_idx]
+                        if tc.get("id"):
+                            td["id"] = tc["id"]
+                        fn = tc.get("function", {})
+                        if fn.get("name"):
+                            td["name"] = fn["name"]
+                        args = fn.get("arguments", "")
+                        if args:
+                            td["arguments"] += args
+                        if not td["started"] and td["name"]:
+                            td["started"] = True
+                            yield _sse("content_block_start", {
+                                "type": "content_block_start",
+                                "index": td["block_idx"],
+                                "content_block": {
+                                    "type": "tool_use",
+                                    "id": td["id"],
+                                    "name": td["name"],
+                                    "input": {},
+                                },
+                            })
+                        if args:
+                            yield _sse("content_block_delta", {
+                                "type": "content_block_delta",
+                                "index": td["block_idx"],
+                                "delta": {"type": "input_json_delta", "partial_json": args},
+                            })
+
+                if finish:
+                    done = True
+                    break
+            if done:
+                break
+
+        if buffer.strip():
+            line = buffer.strip()
+            if line.startswith("data: "):
+                payload = line[6:].strip()
+                if payload == "[DONE]":
+                    finish_reason = finish_reason or "stop"
+
+    except (socket.timeout, ConnectionError, OSError) as e:
+        logger.warning(f"{_C(33)}Stream read interrupted: {e}{_RST}")
+    except GeneratorExit:
+        raise
+
+    for td in tool_data.values():
+        if td.get("started"):
+            yield _sse("content_block_stop", {
+                "type": "content_block_stop", "index": td["block_idx"],
             })
-
-        text = delta.get("content")
-        if text:
-            if thinking_open:
-                yield _sse("content_block_delta", {
-                    "type": "content_block_delta",
-                    "index": think_idx,
-                    "delta": {"type": "signature_delta", "signature": thinking_sig},
-                })
-                yield _sse("content_block_stop", {
-                    "type": "content_block_stop", "index": think_idx,
-                })
-                thinking_open = False
-            if not content_started:
-                content_started = True
-                text_idx = block_idx
-                block_idx += 1
-                yield _sse("content_block_start", {
-                    "type": "content_block_start",
-                    "index": text_idx,
-                    "content_block": {"type": "text", "text": ""},
-                })
-            output_text += text
-            yield _sse("content_block_delta", {
-                "type": "content_block_delta",
-                "index": text_idx,
-                "delta": {"type": "text_delta", "text": text},
-            })
-
-        if finish:
-            break
 
     if thinking_open:
         yield _sse("content_block_delta", {
@@ -345,7 +520,7 @@ def stream_convert(resp, model, rid, input_est):
         yield _sse("content_block_stop", {
             "type": "content_block_stop", "index": text_idx,
         })
-    else:
+    elif not tool_data:
         yield _sse("content_block_start", {
             "type": "content_block_start",
             "index": block_idx,
@@ -361,7 +536,7 @@ def stream_convert(resp, model, rid, input_est):
 
     yield _sse("message_delta", {
         "type": "message_delta",
-        "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+        "delta": {"stop_reason": stream_stop_map.get(finish_reason, "end_turn"), "stop_sequence": None},
         "usage": {"output_tokens": out_tok + think_tok},
     })
     yield _sse("message_stop", {"type": "message_stop"})
@@ -480,6 +655,18 @@ def handle_messages():
         def generate():
             try:
                 yield from stream_convert(upstream, model, rid, input_est)
+            except GeneratorExit:
+                pass
+            except Exception as e:
+                logger.error(f"{_C(31)}X Stream error: {e}{_RST}")
+                try:
+                    yield _sse("error", {
+                        "type": "error",
+                        "error": {"type": "api_error", "message": str(e)},
+                    })
+                    yield _sse("message_stop", {"type": "message_stop"})
+                except GeneratorExit:
+                    pass
             finally:
                 upstream.close()
         return Response(
@@ -488,7 +675,6 @@ def handle_messages():
             headers={
                 **anthropic_headers,
                 "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
                 "X-Accel-Buffering": "no",
             },
         )
@@ -582,6 +768,7 @@ def set_config():
         if "model_aliases" in data and isinstance(data["model_aliases"], dict):
             CONFIG["model_aliases"].update(data["model_aliases"])
     logger.info(f"{_C(32)}Config updated{_RST}")
+    _save_config()
     return jsonify({"status": "ok"})
 
 
@@ -856,19 +1043,38 @@ def catch_all(path):
 
 
 if __name__ == "__main__":
+    _load_config()
+
+    debug_mode = False
+    host = "0.0.0.0"
     port = CONFIG["server_port"]
+
+    for arg in sys.argv[1:]:
+        if arg.startswith("--debug="):
+            debug_mode = arg.split("=", 1)[1].lower() == "true"
+        elif arg.startswith("--host="):
+            host = arg.split("=", 1)[1]
+        elif arg.startswith("--port="):
+            port = int(arg.split("=", 1)[1])
+
     has_key = bool(CONFIG["nvidia_api_key"])
+    server_type = "Flask (debug)" if debug_mode else "Waitress (production)"
 
     print(f"""
 {_C(36)}======================================================
      NIM -> Claude API Proxy Server v2
 ======================================================
-  Anthropic endpoint:  http://0.0.0.0:{port}/v1/messages
-  Web UI:              http://0.0.0.0:{port}/
+  Server:              {server_type}
+  Anthropic endpoint:  http://{host}:{port}/v1/messages
+  Web UI:              http://{host}:{port}/
   NVIDIA API Key:      {'SET' if has_key else 'NOT SET (configure via Web UI)'}
   Proxy API Key:       {CONFIG['proxy_api_key'][:20]}
 ======================================================{_RST}
 """)
 
-    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+    if debug_mode:
+        app.run(host=host, port=port, debug=False, threaded=True)
+    else:
+        from waitress import serve
+        serve(app, host=host, port=port, threads=8)
 
