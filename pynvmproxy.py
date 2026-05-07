@@ -21,7 +21,7 @@ Claude Code 配置 (~/.claude/settings.json):
   }
 """
 
-import json, time, uuid, logging, threading, os, sys, re, socket
+import json, time, uuid, logging, threading, os, sys, re, socket, hmac
 from datetime import datetime
 from collections import deque
 
@@ -38,6 +38,8 @@ CONFIG = {
     "temperature": 1.0,
     "top_p": 1.0,
     "rate_limit": int(os.getenv("RATE_LIMIT", "40")),
+    "stream_idle_timeout": int(os.getenv("STREAM_IDLE_TIMEOUT", "600")),
+    "upstream_read_timeout": int(os.getenv("UPSTREAM_READ_TIMEOUT", "600")),
     "model_aliases": {
         "claude-sonnet-4-20250514": "z-ai/glm-5.1",
         "claude-opus-4-20250514": "z-ai/glm-5.1",
@@ -189,7 +191,25 @@ logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
 USAGE_LOG = deque(maxlen=500)
 USAGE_LOCK = threading.Lock()
+TRACE_LOG = deque(maxlen=200)
+TRACE_LOCK = threading.Lock()
 TOTAL_STATS = {"input": 0, "output": 0, "thinking": 0, "requests": 0}
+CIRCUIT_STATE = {}
+CIRCUIT_LOCK = threading.Lock()
+CIRCUIT_THRESHOLD = 3
+CIRCUIT_COOLDOWN = 30
+
+
+def _update_circuit(model, success):
+    with CIRCUIT_LOCK:
+        cb = CIRCUIT_STATE.get(model, {"failures": 0, "open_until": 0})
+        if success:
+            cb["failures"] = 0
+        else:
+            cb["failures"] += 1
+            if cb["failures"] >= CIRCUIT_THRESHOLD:
+                cb["open_until"] = time.time() + CIRCUIT_COOLDOWN
+        CIRCUIT_STATE[model] = cb
 
 
 def estimate_tokens(text: str) -> int:
@@ -202,7 +222,7 @@ def estimate_tokens(text: str) -> int:
     return max(1, int(cjk / 1.5 + other / 4))
 
 
-def log_usage(model, input_tokens, output_tokens, request_id, thinking_tokens=0):
+def log_usage(model, input_tokens, output_tokens, request_id, thinking_tokens=0, elapsed=None):
     entry = {
         "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "rid": request_id,
@@ -218,11 +238,42 @@ def log_usage(model, input_tokens, output_tokens, request_id, thinking_tokens=0)
         TOTAL_STATS["output"] += output_tokens
         TOTAL_STATS["thinking"] += thinking_tokens
         TOTAL_STATS["requests"] += 1
+    elapsed_str = f" {elapsed:.0f}s" if elapsed else ""
     logger.info(
         f"{_C(36)}Token{_RST} | {request_id[:16]}... | {_C(33)}{model}{_RST} | "
         f"in={_C(32)}{input_tokens}{_RST} out={_C(32)}{output_tokens}{_RST} "
-        f"think={_C(90)}{thinking_tokens}{_RST} total={entry['total']}"
+        f"think={_C(90)}{thinking_tokens}{_RST} total={entry['total']}{elapsed_str}"
     )
+
+
+def _trace(rid, phase, data):
+    with TRACE_LOCK:
+        for t in TRACE_LOG:
+            if t["rid"] == rid:
+                t["steps"].append({"ts": datetime.now().strftime("%H:%M:%S.%f")[:-3], "phase": phase, "data": data})
+                return
+        TRACE_LOG.append({"rid": rid, "ts": datetime.now().strftime("%H:%M:%S"), "steps": [
+            {"ts": datetime.now().strftime("%H:%M:%S.%f")[:-3], "phase": phase, "data": data}
+        ]})
+
+
+def _trim_body(oai_body, max_bytes):
+    msgs = oai_body.get("messages", [])
+    while len(json.dumps(oai_body, ensure_ascii=False)) > max_bytes and len(msgs) > 2:
+        if msgs[0]["role"] == "system":
+            msgs.pop(0)
+        elif len(msgs) >= 4:
+            del msgs[1:3]
+        else:
+            break
+    return oai_body
+
+
+def _sanitize_log(s, max_len=512):
+    s = re.sub(r'"data:([A-Za-z0-9+/=]{100,})"', '"data:<redacted base64>"', str(s))
+    if len(s) > max_len:
+        s = s[:max_len] + f"...<truncated {len(s)}>"
+    return s
 
 
 def resolve_model(model_name: str) -> str:
@@ -423,7 +474,29 @@ def _sse(event_type: str, data: dict) -> str:
     return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+def _safe_json_padding(args_str):
+    """Return padding to append to args_str so the result parses as JSON,
+    or None if no padding is needed or padding is hopeless."""
+    trimmed = args_str.strip()
+    if trimmed == "":
+        return "{}"
+    try:
+        json.loads(trimmed)
+        return None  # already valid
+    except json.JSONDecodeError:
+        pass
+    for cand in ('"}', '}', '"}}', '}}', '"]}', ']}',
+                 'null}', 'null}}', 'null]}', '0}', '0}}', '""}', '""}}'):
+        try:
+            json.loads(trimmed + cand)
+            return cand
+        except json.JSONDecodeError:
+            continue
+    return None  # give up -- let caller only emit content_block_stop
+
+
 def stream_convert(resp, model, rid, input_est):
+    start_ts = time.time()
     output_text = ""
     thinking_text = ""
     content_started = False
@@ -436,6 +509,95 @@ def stream_convert(resp, model, rid, input_est):
     stream_stop_map = {"stop": "end_turn", "length": "max_tokens", "content_filter": "end_turn",
                        "tool_calls": "tool_use"}
     tool_data = {}
+
+    # --- unified SSE closure (defined here so it can close over all state) ---
+    _finalized = [False]  # closure-cell idempotency flag
+
+    def _stop_reason_for(hint, fr, trunc):
+        # design §stop_reason 语义映射表
+        if hint == "idle_timeout":
+            return "max_tokens"
+        if hint == "conn_error":
+            return "end_turn"
+        if hint == "unexpected":
+            return "end_turn"
+        if hint == "eof":
+            return stream_stop_map.get(fr, "end_turn")
+        # "done"
+        if trunc:
+            return "max_tokens"
+        return stream_stop_map.get(fr, "end_turn")
+
+    def _finalize_stream(reason_hint, error_payload=None):
+        if _finalized[0]:
+            return
+        _finalized[0] = True
+
+        nonlocal thinking_open
+
+        # Step 1: close thinking (signature_delta + content_block_stop)
+        if thinking_open:
+            yield _sse("content_block_delta", {
+                "type": "content_block_delta",
+                "index": think_idx,
+                "delta": {"type": "signature_delta", "signature": thinking_sig},
+            })
+            yield _sse("content_block_stop", {
+                "type": "content_block_stop", "index": think_idx,
+            })
+            thinking_open = False
+
+        # Step 2: close tool_use blocks (pad partial_json if needed)
+        for td in tool_data.values():
+            if td.get("started"):
+                padding = _safe_json_padding(td["arguments"])
+                if padding is not None:
+                    yield _sse("content_block_delta", {
+                        "type": "content_block_delta",
+                        "index": td["block_idx"],
+                        "delta": {"type": "input_json_delta", "partial_json": padding},
+                    })
+                yield _sse("content_block_stop", {
+                    "type": "content_block_stop", "index": td["block_idx"],
+                })
+
+        # Step 3: close text block, or emit empty-text placeholder when truly empty
+        if content_started:
+            yield _sse("content_block_stop", {
+                "type": "content_block_stop", "index": text_idx,
+            })
+        elif not tool_data and reason_hint == "done":
+            yield _sse("content_block_start", {
+                "type": "content_block_start",
+                "index": block_idx,
+                "content_block": {"type": "text", "text": ""},
+            })
+            yield _sse("content_block_stop", {
+                "type": "content_block_stop", "index": block_idx,
+            })
+
+        # Step 4: token accounting + usage log
+        out_tok = estimate_tokens(output_text)
+        think_tok = estimate_tokens(thinking_text)
+        log_usage(model, input_est, out_tok, rid, think_tok, time.time() - start_ts)
+        elapsed = time.time() - start_ts
+        _trace(rid, "stream_done", {"elapsed": f"{elapsed:.1f}s", "in_tok": input_est, "out_tok": out_tok, "think_tok": think_tok, "truncated": truncated})
+
+        # Step 5: message_delta with semantic stop_reason
+        stop_reason = _stop_reason_for(reason_hint, finish_reason, truncated)
+        yield _sse("message_delta", {
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+            "usage": {"output_tokens": out_tok + think_tok},
+        })
+
+        # Step 6: optional error event (unexpected path only) — emit BEFORE message_stop
+        # so that message_stop remains the genuine terminal SSE event.
+        if reason_hint == "unexpected" and error_payload is not None:
+            yield _sse("error", error_payload)
+
+        # Step 7: sole terminal message_stop
+        yield _sse("message_stop", {"type": "message_stop"})
 
     yield _sse("message_start", {
         "type": "message_start",
@@ -451,212 +613,211 @@ def stream_convert(resp, model, rid, input_est):
         },
     })
 
+    # Load configurable idle timeout once (avoid lock contention per read)
+    with CONFIG_LOCK:
+        stream_idle_timeout_val = CONFIG.get("stream_idle_timeout", 600)
+
     try:
-        raw_sock = resp.raw._fp.fp.raw._sock
-        if raw_sock:
-            raw_sock.settimeout(15)
+        sock = None
+        for chain in [
+            lambda r: r.raw._fp.fp.raw._sock,
+            lambda r: r.raw._fp.fp._sock,
+            lambda r: r.raw._fp.fp,
+        ]:
+            try:
+                sock = chain(resp)
+                if hasattr(sock, "settimeout"):
+                    sock.settimeout(15)
+                    break
+            except Exception:
+                continue
+        if sock is None:
+            logger.warning(f"{_C(33)}Could not set socket timeout on upstream connection{_RST}")
     except Exception:
         pass
 
-    buffer = ""
-    done = False
-    truncated = False
-    last_data = time.time()
-    while not done:
-        try:
-            chunk = resp.raw.read(8192, decode_content=True)
-        except GeneratorExit:
-            raise
-        except socket.timeout:
-            if time.time() - last_data > 90:
-                truncated = True
-                finish_reason = "length"
-                logger.warning(f"{_C(33)}Stream silent for 90s, terminating{_RST}")
-                break
-            yield _sse("ping", {"type": "ping"})
-            continue
-        except (ConnectionError, OSError) as e:
-            truncated = True
-            logger.warning(f"{_C(33)}Stream read error: {e}{_RST}")
-            break
-
-        if not chunk:
-            break
-
+        buffer = ""
+        done = False
+        truncated = False
         last_data = time.time()
-        if isinstance(chunk, bytes):
-            chunk = chunk.decode("utf-8", errors="replace")
-        buffer += chunk
-
-        while "\n" in buffer:
-            line, buffer = buffer.split("\n", 1)
-            line = line.strip()
-            if not line or not line.startswith("data: "):
-                continue
-            payload = line[6:].strip()
-            if payload == "[DONE]":
-                finish_reason = finish_reason or "stop"
-                done = True
-                break
+        while not done:
             try:
-                ck = json.loads(payload)
-            except json.JSONDecodeError:
+                chunk = resp.raw.read(8192, decode_content=True)
+            except GeneratorExit:
+                raise
+            except socket.timeout:
+                if time.time() - last_data > stream_idle_timeout_val:
+                    logger.warning(f"{_C(33)}Stream silent for {stream_idle_timeout_val}s, terminating{_RST}")
+                    yield from _finalize_stream("idle_timeout")
+                    return
+                yield _sse("ping", {"type": "ping"})
                 continue
+            except (ConnectionError, OSError) as e:
+                logger.warning(f"{_C(33)}Stream read error: {e}{_RST}")
+                yield from _finalize_stream("conn_error")
+                return
+            except Exception as e:
+                err_str = str(e).lower()
+                if "timed out" in err_str or "timeout" in err_str:
+                    if time.time() - last_data > stream_idle_timeout_val:
+                        logger.warning(f"{_C(33)}Stream silent for {stream_idle_timeout_val}s, terminating{_RST}")
+                        yield from _finalize_stream("idle_timeout")
+                        return
+                    yield _sse("ping", {"type": "ping"})
+                    continue
+                raise
 
-            choices = ck.get("choices")
-            if not choices:
-                continue
-            delta = choices[0].get("delta", {})
-            finish = choices[0].get("finish_reason")
-            if finish:
-                finish_reason = finish
+            if not chunk:
+                break
 
-            reasoning = delta.get("reasoning_content")
-            if reasoning:
-                if not thinking_open:
-                    thinking_open = True
-                    think_idx = block_idx
-                    block_idx += 1
-                    yield _sse("content_block_start", {
-                        "type": "content_block_start",
-                        "index": think_idx,
-                        "content_block": {
-                            "type": "thinking",
-                            "thinking": "",
-                            "signature": "",
-                        },
-                    })
-                thinking_text += reasoning
-                yield _sse("content_block_delta", {
-                    "type": "content_block_delta",
-                    "index": think_idx,
-                    "delta": {"type": "thinking_delta", "thinking": reasoning},
-                })
+            last_data = time.time()
+            if isinstance(chunk, bytes):
+                chunk = chunk.decode("utf-8", errors="replace")
+            buffer += chunk
 
-            text = delta.get("content")
-            if text:
-                if thinking_open:
-                    yield _sse("content_block_delta", {
-                        "type": "content_block_delta",
-                        "index": think_idx,
-                        "delta": {"type": "signature_delta", "signature": thinking_sig},
-                    })
-                    yield _sse("content_block_stop", {
-                        "type": "content_block_stop", "index": think_idx,
-                    })
-                    thinking_open = False
-                if not content_started:
-                    content_started = True
-                    text_idx = block_idx
-                    block_idx += 1
-                    yield _sse("content_block_start", {
-                        "type": "content_block_start",
-                        "index": text_idx,
-                        "content_block": {"type": "text", "text": ""},
-                    })
-                output_text += text
-                yield _sse("content_block_delta", {
-                    "type": "content_block_delta",
-                    "index": text_idx,
-                    "delta": {"type": "text_delta", "text": text},
-                })
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                line = line.strip()
+                if not line or not line.startswith("data: "):
+                    continue
+                payload = line[6:].strip()
+                if payload == "[DONE]":
+                    finish_reason = finish_reason or "stop"
+                    done = True
+                    break
+                try:
+                    ck = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
 
-            tool_calls = delta.get("tool_calls")
-            if tool_calls:
-                if thinking_open:
-                    yield _sse("content_block_delta", {
-                        "type": "content_block_delta",
-                        "index": think_idx,
-                        "delta": {"type": "signature_delta", "signature": thinking_sig},
-                    })
-                    yield _sse("content_block_stop", {
-                        "type": "content_block_stop", "index": think_idx,
-                    })
-                    thinking_open = False
-                for tc in tool_calls:
-                    tc_idx = tc.get("index", 0)
-                    if tc_idx not in tool_data:
-                        tool_block = block_idx
+                choices = ck.get("choices")
+                if not choices:
+                    continue
+                delta = choices[0].get("delta", {})
+                finish = choices[0].get("finish_reason")
+                if finish:
+                    finish_reason = finish
+
+                reasoning = delta.get("reasoning_content")
+                if reasoning:
+                    if not thinking_open:
+                        thinking_open = True
+                        think_idx = block_idx
                         block_idx += 1
-                        tool_data[tc_idx] = {
-                            "block_idx": tool_block,
-                            "id": tc.get("id") or f"toolu_{uuid.uuid4().hex[:24]}",
-                            "name": "",
-                            "arguments": "",
-                            "started": False,
-                        }
-                    td = tool_data[tc_idx]
-                    if tc.get("id"):
-                        td["id"] = tc["id"]
-                    fn = tc.get("function", {})
-                    if fn.get("name"):
-                        td["name"] = fn["name"]
-                    args = fn.get("arguments", "")
-                    if args:
-                        td["arguments"] += args
-                    if not td["started"] and td["name"]:
-                        td["started"] = True
                         yield _sse("content_block_start", {
                             "type": "content_block_start",
-                            "index": td["block_idx"],
+                            "index": think_idx,
                             "content_block": {
-                                "type": "tool_use",
-                                "id": td["id"],
-                                "name": td["name"],
-                                "input": {},
+                                "type": "thinking",
+                                "thinking": "",
+                                "signature": "",
                             },
                         })
-                    if args:
+                    thinking_text += reasoning
+                    yield _sse("content_block_delta", {
+                        "type": "content_block_delta",
+                        "index": think_idx,
+                        "delta": {"type": "thinking_delta", "thinking": reasoning},
+                    })
+
+                text = delta.get("content")
+                if text:
+                    if thinking_open:
                         yield _sse("content_block_delta", {
                             "type": "content_block_delta",
-                            "index": td["block_idx"],
-                            "delta": {"type": "input_json_delta", "partial_json": args},
+                            "index": think_idx,
+                            "delta": {"type": "signature_delta", "signature": thinking_sig},
                         })
+                        yield _sse("content_block_stop", {
+                            "type": "content_block_stop", "index": think_idx,
+                        })
+                        thinking_open = False
+                    if not content_started:
+                        content_started = True
+                        text_idx = block_idx
+                        block_idx += 1
+                        yield _sse("content_block_start", {
+                            "type": "content_block_start",
+                            "index": text_idx,
+                            "content_block": {"type": "text", "text": ""},
+                        })
+                    output_text += text
+                    yield _sse("content_block_delta", {
+                        "type": "content_block_delta",
+                        "index": text_idx,
+                        "delta": {"type": "text_delta", "text": text},
+                    })
 
-            if finish:
-                done = True
-                break
+                tool_calls = delta.get("tool_calls")
+                if tool_calls:
+                    if thinking_open:
+                        yield _sse("content_block_delta", {
+                            "type": "content_block_delta",
+                            "index": think_idx,
+                            "delta": {"type": "signature_delta", "signature": thinking_sig},
+                        })
+                        yield _sse("content_block_stop", {
+                            "type": "content_block_stop", "index": think_idx,
+                        })
+                        thinking_open = False
+                    for tc in tool_calls:
+                        tc_idx = tc.get("index", 0)
+                        if tc_idx not in tool_data:
+                            tool_block = block_idx
+                            block_idx += 1
+                            tool_data[tc_idx] = {
+                                "block_idx": tool_block,
+                                "id": tc.get("id") or f"toolu_{uuid.uuid4().hex[:24]}",
+                                "name": "",
+                                "arguments": "",
+                                "started": False,
+                            }
+                        td = tool_data[tc_idx]
+                        if tc.get("id"):
+                            td["id"] = tc["id"]
+                        fn = tc.get("function", {})
+                        if fn.get("name"):
+                            td["name"] = fn["name"]
+                        args = fn.get("arguments", "")
+                        if args:
+                            td["arguments"] += args
+                        if not td["started"] and td["name"]:
+                            td["started"] = True
+                            yield _sse("content_block_start", {
+                                "type": "content_block_start",
+                                "index": td["block_idx"],
+                                "content_block": {
+                                    "type": "tool_use",
+                                    "id": td["id"],
+                                    "name": td["name"],
+                                    "input": {},
+                                },
+                            })
+                        if args:
+                            yield _sse("content_block_delta", {
+                                "type": "content_block_delta",
+                                "index": td["block_idx"],
+                                "delta": {"type": "input_json_delta", "partial_json": args},
+                            })
 
-    for td in tool_data.values():
-        if td.get("started"):
-            yield _sse("content_block_stop", {
-                "type": "content_block_stop", "index": td["block_idx"],
-            })
+                if finish:
+                    done = True
+                    break
 
-    if thinking_open:
-        yield _sse("content_block_delta", {
-            "type": "content_block_delta",
-            "index": think_idx,
-            "delta": {"type": "signature_delta", "signature": thinking_sig},
+        # Reached here via `done=True` (finish_reason or [DONE]) OR `not chunk` (EOF)
+        if done:
+            yield from _finalize_stream("done")
+        else:
+            yield from _finalize_stream("eof")
+    except GeneratorExit:
+        raise
+    except Exception as e:
+        logger.error(f"{_C(31)}X stream_convert unexpected error: {e}{_RST}")
+        yield from _finalize_stream("unexpected", error_payload={
+            "type": "error",
+            "error": {"type": "api_error", "message": str(e)},
         })
-        yield _sse("content_block_stop", {
-            "type": "content_block_stop", "index": think_idx,
-        })
-    if content_started:
-        yield _sse("content_block_stop", {
-            "type": "content_block_stop", "index": text_idx,
-        })
-    elif not tool_data:
-        yield _sse("content_block_start", {
-            "type": "content_block_start",
-            "index": block_idx,
-            "content_block": {"type": "text", "text": ""},
-        })
-        yield _sse("content_block_stop", {
-            "type": "content_block_stop", "index": block_idx,
-        })
-
-    out_tok = estimate_tokens(output_text)
-    think_tok = estimate_tokens(thinking_text)
-    log_usage(model, input_est, out_tok, rid, think_tok)
-
-    stop_reason = "max_tokens" if truncated else stream_stop_map.get(finish_reason, "end_turn")
-    yield _sse("message_delta", {
-        "type": "message_delta",
-        "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-        "usage": {"output_tokens": out_tok + think_tok},
-    })
-    yield _sse("message_stop", {"type": "message_stop"})
+        return
 
 
 app = Flask(__name__)
@@ -670,7 +831,7 @@ def _auth_check():
         return True
     key = (request.headers.get("x-api-key")
            or request.headers.get("Authorization", "").removeprefix("Bearer ").strip())
-    return key == expected
+    return hmac.compare_digest(key.encode(), expected.encode())
 
 
 @app.before_request
@@ -717,15 +878,22 @@ def handle_messages():
                             "message": f"Unknown model: {model}. Check available models at /api/models"
                             }}), 400
 
+    oai_body = anthropic_to_openai(body)
+    input_est = estimate_tokens(json.dumps(oai_body.get("messages", []), ensure_ascii=False))
+    body_size = len(json.dumps(oai_body, ensure_ascii=False))
+
     logger.info(
         f"{_C(35)}-> REQ{_RST} | {rid[:16]}... | "
         f"model={_C(33)}{raw_model}{_RST}->{_C(32)}{model}{_RST} | "
         f"stream={is_stream} | msgs={msg_count} | "
-        f"sys={system_len}c | thinking={thinking_cfg}"
+        f"sys={system_len}c | thinking={thinking_cfg} | {body_size//1024}KB"
     )
+    _trace(rid, "request", {"model": model, "stream": is_stream, "msgs": msg_count, "sys_chars": system_len, "thinking": str(thinking_cfg)})
 
-    oai_body = anthropic_to_openai(body)
-    input_est = estimate_tokens(json.dumps(oai_body.get("messages", []), ensure_ascii=False))
+    if body_size > 200 * 1024:
+        oai_body = _trim_body(oai_body, 200 * 1024)
+        new_size = len(json.dumps(oai_body, ensure_ascii=False))
+        logger.warning(f"{_C(33)}Body trimmed: {body_size//1024}KB -> {new_size//1024}KB{_RST}")
 
     with CONFIG_LOCK:
         base_url = CONFIG["nvidia_base_url"].rstrip("/")
@@ -746,10 +914,27 @@ def handle_messages():
     if extra:
         oai_body.update(extra)
 
+    with CIRCUIT_LOCK:
+        cb = CIRCUIT_STATE.get(model, {"failures": 0, "open_until": 0})
+        now_ts = time.time()
+        if cb["failures"] >= CIRCUIT_THRESHOLD and now_ts < cb["open_until"]:
+            retry_after = int(cb["open_until"] - now_ts)
+            logger.warning(f"{_C(33)}Circuit OPEN for {model} | retry-after={retry_after}s{_RST}")
+            _trace(rid, "circuit_open", {"model": model, "retry_after": retry_after})
+            resp = jsonify({"type": "error", "error": {"type": "overloaded_error",
+                            "message": f"Upstream temporarily unavailable. Retry after {retry_after}s."}})
+            resp.headers["Retry-After"] = str(retry_after)
+            resp.status_code = 503
+            return resp
+
     import requests as http_req
 
     target_url = f"{base_url}/chat/completions"
+    _trace(rid, "upstream", {"url": target_url})
     logger.info(f"{_C(90)}   Upstream: POST {target_url} | body keys={list(oai_body.keys())}{_RST}")
+
+    with CONFIG_LOCK:
+        read_timeout = CONFIG.get("upstream_read_timeout", 600)
 
     RETRYABLE_STATUS = {502, 503, 504}
     MAX_RETRIES = 3
@@ -761,12 +946,12 @@ def handle_messages():
                 headers=headers,
                 json=oai_body,
                 stream=is_stream,
-                timeout=(15, 120),
+                timeout=(15, read_timeout),
             )
             if upstream.status_code in RETRYABLE_STATUS and attempt < MAX_RETRIES:
                 upstream.close()
                 delay = 2 ** attempt
-                err_text = upstream.text[:200]
+                err_text = _sanitize_log(upstream.text, 200)
                 logger.warning(
                     f"{_C(33)}Retry {attempt + 1}/{MAX_RETRIES}: upstream {upstream.status_code}"
                     f" | delay={delay}s | {err_text}{_RST}"
@@ -790,18 +975,24 @@ def handle_messages():
                 time.sleep(delay)
                 continue
             logger.error(f"{_C(31)}X Upstream connection failed after {MAX_RETRIES + 1} attempts: {e}{_RST}")
+            _update_circuit(model, False)
             return jsonify({"type": "error", "error": {"type": "api_error",
                             "message": str(e)}}), 502
 
     if upstream is None or upstream.status_code != 200:
-        err_text = upstream.text[:500] if upstream else "no response"
+        err_text = _sanitize_log(upstream.text, 500) if upstream else "no response"
         status = upstream.status_code if upstream else 502
         logger.error(f"{_C(31)}X Upstream {status} after {MAX_RETRIES + 1} attempts: {err_text}{_RST}")
+        _trace(rid, "upstream_error", {"status": status, "error": err_text[:200]})
+        _update_circuit(model, False)
         return jsonify({"type": "error", "error": {"type": "api_error",
                         "message": f"Upstream {status}: {err_text}"
                         }}), status
 
+    _update_circuit(model, True)
+
     logger.info(f"{_C(32)}OK Upstream 200{_RST} | stream={is_stream}")
+    _trace(rid, "upstream_ok", {"status": 200, "stream": is_stream})
 
     anthropic_headers = {
         "x-request-id": rid,
@@ -815,15 +1006,9 @@ def handle_messages():
             except GeneratorExit:
                 pass
             except Exception as e:
-                logger.error(f"{_C(31)}X Stream error: {e}{_RST}")
-                try:
-                    yield _sse("error", {
-                        "type": "error",
-                        "error": {"type": "api_error", "message": str(e)},
-                    })
-                    yield _sse("message_stop", {"type": "message_stop"})
-                except GeneratorExit:
-                    pass
+                # stream_convert 已通过 _finalize_stream("unexpected") 下发合规闭合序列
+                # 这里只记录日志，不再补发 error / message_stop，避免双重收尾
+                logger.error(f"{_C(31)}X Stream outer error (already finalized): {e}{_RST}")
             finally:
                 upstream.close()
         return Response(
@@ -904,6 +1089,17 @@ def _openai_passthrough():
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
     target_url = f"{base_url}/chat/completions"
 
+    with CIRCUIT_LOCK:
+        cb = CIRCUIT_STATE.get(model, {"failures": 0, "open_until": 0})
+        now_ts = time.time()
+        if cb["failures"] >= CIRCUIT_THRESHOLD and now_ts < cb["open_until"]:
+            retry_after = int(cb["open_until"] - now_ts)
+            logger.warning(f"{_C(33)}Circuit OPEN for {model} | retry-after={retry_after}s{_RST}")
+            resp = jsonify({"error": {"message": f"Upstream temporarily unavailable. Retry after {retry_after}s.", "type": "overloaded_error"}})
+            resp.headers["Retry-After"] = str(retry_after)
+            resp.status_code = 503
+            return resp
+
     import requests as http_req
     RETRYABLE = {502, 503, 504}
     MAX_RETRIES = 3
@@ -929,8 +1125,10 @@ def _openai_passthrough():
         except Exception:
             err = {"message": upstream.text[:500] if upstream else "no response"}
         logger.error(f"{_C(31)}X OAI upstream {status}{_RST}")
+        _update_circuit(model, False)
         return jsonify(err), status
 
+    _update_circuit(model, True)
     logger.info(f"{_C(32)}OK OAI upstream 200{_RST} | stream={is_stream}")
 
     if is_stream:
@@ -1037,6 +1235,21 @@ def health():
         "status": "ok",
         "api_key_configured": api_key_set,
     })
+
+
+@app.route("/api/trace", methods=["GET"])
+def list_traces():
+    with TRACE_LOCK:
+        return jsonify([{"rid": t["rid"], "ts": t["ts"], "steps": len(t["steps"])} for t in TRACE_LOG])
+
+
+@app.route("/api/trace/<rid>", methods=["GET"])
+def get_trace(rid):
+    with TRACE_LOCK:
+        for t in TRACE_LOG:
+            if t["rid"] == rid or t["rid"].startswith(rid):
+                return jsonify(t)
+    return jsonify({"error": "not found"}), 404
 
 
 @app.route("/api/models", methods=["GET"])

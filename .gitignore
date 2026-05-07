@@ -1,2 +1,5 @@
 config.json
 *.pyc
+/memory.md
+/task.md
+/feedback.md
