@@ -37,6 +37,7 @@ CONFIG = {
     "max_tokens": 16384,
     "temperature": 1.0,
     "top_p": 1.0,
+    "rate_limit": int(os.getenv("RATE_LIMIT", "40")),
     "model_aliases": {
         "claude-sonnet-4-20250514": "z-ai/glm-5.1",
         "claude-opus-4-20250514": "z-ai/glm-5.1",
@@ -48,6 +49,83 @@ CONFIG = {
 }
 CONFIG_LOCK = threading.Lock()
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
+_MODEL_CACHE = {"models": [], "ts": 0}
+_MODEL_CACHE_TTL = 3600
+
+_FALLBACK_MODELS = [
+    "z-ai/glm-5.1",
+    "deepseek-ai/deepseek-r1",
+    "meta/llama-4-maverick-17b-128e-instruct",
+    "nvidia/llama-3.1-nemotron-ultra-253b-v1",
+    "qwen/qwen2.5-72b-instruct",
+]
+
+
+def _fetch_nvidia_models():
+    now = time.time()
+    if _MODEL_CACHE["models"] and (now - _MODEL_CACHE["ts"]) < _MODEL_CACHE_TTL:
+        return _MODEL_CACHE["models"]
+
+    with CONFIG_LOCK:
+        api_key = CONFIG["nvidia_api_key"]
+        base_url = CONFIG["nvidia_base_url"].rstrip("/")
+
+    if not api_key:
+        logger.warning("No API key, using fallback models")
+    return _FALLBACK_MODELS
+
+
+RATE_WINDOW = deque()
+RATE_LOCK = threading.Lock()
+
+
+def _check_rate_limit():
+    with CONFIG_LOCK:
+        limit = CONFIG.get("rate_limit", 40)
+    now = time.time()
+    with RATE_LOCK:
+        window = 60
+        while RATE_WINDOW and RATE_WINDOW[0] < now - window:
+            RATE_WINDOW.popleft()
+        current = len(RATE_WINDOW)
+        allowed = current < limit
+        if allowed:
+            RATE_WINDOW.append(now)
+        return allowed, current, limit
+
+
+def _get_qps():
+    now = time.time()
+    with RATE_LOCK:
+        window = 60
+        while RATE_WINDOW and RATE_WINDOW[0] < now - window:
+            RATE_WINDOW.popleft()
+        return len(RATE_WINDOW)
+
+    try:
+        import requests as _r
+        resp = _r.get(f"{base_url}/models", headers={
+            "Authorization": f"Bearer {api_key}",
+        }, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            models = []
+            for m in data.get("data", []):
+                mid = m.get("id", "")
+                if mid:
+                    models.append(mid)
+            if models:
+                _MODEL_CACHE["models"] = models
+                _MODEL_CACHE["ts"] = now
+                logger.info(f"{_C(32)}Fetched {len(models)} models from NVIDIA{_RST}")
+                return models
+    except Exception as e:
+        logger.warning(f"{_C(33)}Failed to fetch models: {e}{_RST}")
+
+    if _MODEL_CACHE["models"]:
+        return _MODEL_CACHE["models"]
+    return _FALLBACK_MODELS
 
 
 def _save_config():
@@ -588,6 +666,13 @@ def handle_messages():
         return jsonify({"type": "error", "error": {"type": "authentication_error",
                         "message": "Invalid API key"}}), 401
 
+    allowed, current, limit = _check_rate_limit()
+    if not allowed:
+        logger.warning(f"{_C(33)}Rate limit: {current}/{limit} per minute{_RST}")
+        return jsonify({"type": "error", "error": {"type": "rate_limit_error",
+                        "message": f"Rate limit exceeded: {current}/{limit} requests per minute. Retry later."
+                        }}), 429
+
     body = request.get_json(force=True)
     rid = f"msg_{uuid.uuid4().hex[:24]}"
     raw_model = body.get("model", "")
@@ -635,29 +720,55 @@ def handle_messages():
     target_url = f"{base_url}/chat/completions"
     logger.info(f"{_C(90)}   Upstream: POST {target_url} | body keys={list(oai_body.keys())}{_RST}")
 
-    try:
-        upstream = http_req.post(
-            target_url,
-            headers=headers,
-            json=oai_body,
-            stream=is_stream,
-            timeout=(15, 120),
-        )
-    except http_req.exceptions.Timeout:
-        logger.error(f"{_C(31)}X Upstream timeout (300s){_RST}")
-        return jsonify({"type": "error", "error": {"type": "api_error",
-                        "message": "Upstream request timed out (300s)"}}), 504
-    except Exception as e:
-        logger.error(f"{_C(31)}X Upstream connection failed: {e}{_RST}")
-        return jsonify({"type": "error", "error": {"type": "api_error",
-                        "message": str(e)}}), 502
+    RETRYABLE_STATUS = {502, 503, 504}
+    MAX_RETRIES = 3
+    upstream = None
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            upstream = http_req.post(
+                target_url,
+                headers=headers,
+                json=oai_body,
+                stream=is_stream,
+                timeout=(15, 120),
+            )
+            if upstream.status_code in RETRYABLE_STATUS and attempt < MAX_RETRIES:
+                upstream.close()
+                delay = 2 ** attempt
+                err_text = upstream.text[:200]
+                logger.warning(
+                    f"{_C(33)}Retry {attempt + 1}/{MAX_RETRIES}: upstream {upstream.status_code}"
+                    f" | delay={delay}s | {err_text}{_RST}"
+                )
+                time.sleep(delay)
+                continue
+            break
+        except http_req.exceptions.Timeout:
+            if attempt < MAX_RETRIES:
+                delay = 2 ** attempt
+                logger.warning(f"{_C(33)}Retry {attempt + 1}/{MAX_RETRIES}: timeout | delay={delay}s{_RST}")
+                time.sleep(delay)
+                continue
+            logger.error(f"{_C(31)}X Upstream timeout after {MAX_RETRIES + 1} attempts{_RST}")
+            return jsonify({"type": "error", "error": {"type": "api_error",
+                            "message": "Upstream request timed out"}}), 504
+        except Exception as e:
+            if attempt < MAX_RETRIES:
+                delay = 2 ** attempt
+                logger.warning(f"{_C(33)}Retry {attempt + 1}/{MAX_RETRIES}: {e} | delay={delay}s{_RST}")
+                time.sleep(delay)
+                continue
+            logger.error(f"{_C(31)}X Upstream connection failed after {MAX_RETRIES + 1} attempts: {e}{_RST}")
+            return jsonify({"type": "error", "error": {"type": "api_error",
+                            "message": str(e)}}), 502
 
-    if upstream.status_code != 200:
-        err_text = upstream.text[:500]
-        logger.error(f"{_C(31)}X Upstream {upstream.status_code}: {err_text}{_RST}")
+    if upstream is None or upstream.status_code != 200:
+        err_text = upstream.text[:500] if upstream else "no response"
+        status = upstream.status_code if upstream else 502
+        logger.error(f"{_C(31)}X Upstream {status} after {MAX_RETRIES + 1} attempts: {err_text}{_RST}")
         return jsonify({"type": "error", "error": {"type": "api_error",
-                        "message": f"Upstream {upstream.status_code}: {err_text}"
-                        }}), upstream.status_code
+                        "message": f"Upstream {status}: {err_text}"
+                        }}), status
 
     logger.info(f"{_C(32)}OK Upstream 200{_RST} | stream={is_stream}")
 
@@ -729,13 +840,7 @@ def messages_no_prefix():
 
 @app.route("/v1/models", methods=["GET"])
 def list_models():
-    models = [
-        "z-ai/glm-5.1",
-        "deepseek-ai/deepseek-r1",
-        "meta/llama-4-maverick-17b-128e-instruct",
-        "nvidia/llama-3.1-nemotron-ultra-253b-v1",
-        "qwen/qwen2.5-72b-instruct",
-    ]
+    models = _fetch_nvidia_models()
     return jsonify({
         "data": [{"id": m, "object": "model", "created": 0, "owned_by": "nvidia-nim"}
                  for m in models],
@@ -780,6 +885,8 @@ def set_config():
             CONFIG["temperature"] = float(data["temperature"])
         if "top_p" in data:
             CONFIG["top_p"] = float(data["top_p"])
+        if "rate_limit" in data:
+            CONFIG["rate_limit"] = int(data["rate_limit"])
         if "model_aliases" in data and isinstance(data["model_aliases"], dict):
             CONFIG["model_aliases"].update(data["model_aliases"])
     logger.info(f"{_C(32)}Config updated{_RST}")
@@ -790,9 +897,14 @@ def set_config():
 @app.route("/api/usage", methods=["GET"])
 def get_usage():
     with USAGE_LOCK:
+        qps = _get_qps()
+        with CONFIG_LOCK:
+            max_qps = CONFIG.get("rate_limit", 40)
         return jsonify({
             "total": dict(TOTAL_STATS),
             "recent": list(USAGE_LOG)[-50:],
+            "qps": qps,
+            "max_qps": max_qps,
         })
 
 
@@ -811,67 +923,145 @@ WEB_PAGE = r'''<!DOCTYPE html>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>NIM to Claude Proxy</title>
 <style>
-:root{--bg:#0f172a;--card:#1e293b;--accent:#38bdf8;--accent2:#818cf8;
-      --text:#e2e8f0;--muted:#94a3b8;--border:#334155;--green:#22c55e;--red:#ef4444;--warn:#f59e0b}
+:root{--bg:#0b0f19;--surface:#131a2b;--card:#182035;--accent:#38bdf8;--accent2:#818cf8;
+      --text:#e4e8f0;--muted:#7b89a0;--border:#1e2d45;--green:#22c55e;--red:#ef4444;--warn:#f59e0b;--orange:#fb923c}
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);
-     min-height:100vh;padding:20px}
-.container{max-width:960px;margin:0 auto}
-h1{font-size:1.5rem;margin-bottom:4px;background:linear-gradient(135deg,var(--accent),var(--accent2));
-   -webkit-background-clip:text;-webkit-text-fill-color:transparent}
-.subtitle{color:var(--muted);font-size:.85rem;margin-bottom:24px}
-.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:20px}
-.card h2{font-size:1.1rem;margin-bottom:16px;color:var(--accent)}
+body{font-family:'Inter','Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+.container{max-width:1060px;margin:0 auto;padding:24px 20px 40px}
+
+header{display:flex;align-items:center;justify-content:space-between;margin-bottom:28px;flex-wrap:wrap;gap:12px}
+header h1{font-size:1.4rem;font-weight:700;background:linear-gradient(135deg,var(--accent),var(--accent2));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+header .status{display:flex;align-items:center;gap:6px;font-size:.78rem;color:var(--muted)}
+header .dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex-shrink:0}
+header .dot.on{background:var(--green);box-shadow:0 0 6px var(--green)}
+header .dot.off{background:var(--red);box-shadow:0 0 6px var(--red)}
+
+.stats-row{display:grid;grid-template-columns:repeat(5,1fr);gap:14px;margin-bottom:24px}
+.stat-card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:20px 16px;text-align:center;transition:border-color .2s,transform .15s}
+.stat-card:hover{border-color:var(--accent);transform:translateY(-1px)}
+.stat-card .val{font-size:1.8rem;font-weight:800;line-height:1.2;letter-spacing:-.02em}
+.stat-card .val.accent{color:var(--accent)}
+.stat-card .val.green{color:var(--green)}
+.stat-card .val.warn{color:var(--orange)}
+.stat-card .val.red{color:var(--red)}
+.stat-card .lbl{font-size:.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-top:6px}
+
+.qps-row{margin-bottom:24px;display:flex;align-items:center;gap:12px;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:14px 18px}
+.qps-row .qps-label{font-size:.8rem;color:var(--muted);white-space:nowrap;font-weight:600;text-transform:uppercase;letter-spacing:.5px}
+.qps-bar-wrap{flex:1;height:10px;background:var(--bg);border-radius:99px;overflow:hidden}
+.qps-bar{height:100%;border-radius:99px;transition:width .6s ease,background .4s}
+.qps-bar.safe{background:var(--green)}
+.qps-bar.warn{background:var(--orange)}
+.qps-bar.danger{background:var(--red)}
+.qps-row .qps-val{font-size:.85rem;font-weight:700;min-width:60px;text-align:right;font-variant-numeric:tabular-nums}
+
+.panel{background:var(--card);border:1px solid var(--border);border-radius:12px;margin-bottom:16px;overflow:hidden}
+.panel-header{padding:14px 18px;cursor:pointer;display:flex;align-items:center;justify-content:space-between;user-select:none;transition:background .15s}
+.panel-header:hover{background:rgba(255,255,255,.02)}
+.panel-header h2{font-size:.95rem;font-weight:600;color:var(--text)}
+.panel-header .arrow{font-size:.7rem;color:var(--muted);transition:transform .25s}
+.panel.open .panel-header .arrow{transform:rotate(90deg)}
+.panel-body{display:none;padding:0 18px 18px}
+.panel.open .panel-body{display:block}
+
 .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-.field{margin-bottom:14px}
-.field label{display:block;font-size:.78rem;color:var(--muted);margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px}
-.field input,.field select,.field textarea{width:100%;padding:10px 12px;background:#0f172a;
-     border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:.9rem;outline:none;transition:border .2s;font-family:inherit}
-.field input:focus,.field textarea:focus{border-color:var(--accent)}
-.field textarea{min-height:80px;resize:vertical;font-family:'Cascadia Code','Fira Code',monospace;font-size:.8rem}
+.field{margin-bottom:12px}
+.field label{display:block;font-size:.72rem;color:var(--muted);margin-bottom:4px;text-transform:uppercase;letter-spacing:.4px;font-weight:600}
+.field input,.field select{width:100%;padding:9px 12px;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:.85rem;outline:none;transition:border .2s}
+.field input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(56,189,248,.1)}
 .check-row{display:flex;align-items:center;gap:8px;margin:8px 0}
-.check-row input{accent-color:var(--accent)}
-button{padding:10px 24px;border:none;border-radius:8px;font-size:.9rem;font-weight:600;cursor:pointer;transition:all .2s}
-.btn-primary{background:var(--accent);color:#0f172a}
-.btn-primary:hover{opacity:.85}
-.toast{position:fixed;top:20px;right:20px;padding:12px 20px;border-radius:8px;
-       background:var(--green);color:#fff;font-weight:600;opacity:0;transition:opacity .3s;z-index:99}
-.toast.show{opacity:1}
-table{width:100%;border-collapse:collapse;font-size:.82rem}
-th{text-align:left;color:var(--muted);border-bottom:1px solid var(--border);padding:8px 6px;font-weight:500}
-td{padding:6px;border-bottom:1px solid #1e293b}
-.mono{font-family:'Cascadia Code','Fira Code',monospace;font-size:.8rem}
-.stat-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px}
-.stat-box{text-align:center;padding:16px;background:#0f172a;border-radius:8px;border:1px solid var(--border)}
-.stat-box .num{font-size:1.6rem;font-weight:700;color:var(--accent)}
-.stat-box .lbl{font-size:.7rem;color:var(--muted);text-transform:uppercase;margin-top:4px}
-.endpoint{background:#0f172a;border:1px solid var(--border);border-radius:8px;padding:12px 16px;
-          font-family:monospace;font-size:.82rem;margin:8px 0;color:var(--accent);word-break:break-all}
-.help{background:#1e293b;border-left:3px solid var(--accent2);padding:12px 16px;margin:12px 0;
-      border-radius:0 8px 8px 0;font-size:.84rem;line-height:1.6}
-.help code{background:#0f172a;padding:2px 6px;border-radius:4px;font-size:.8rem;color:var(--accent)}
-.warn-box{background:#f59e0b15;border:1px solid #f59e0b44;border-radius:8px;padding:12px 16px;
-          margin:8px 0;font-size:.84rem;color:var(--warn)}
-.tag{display:inline-block;background:var(--accent2);color:#fff;font-size:.7rem;padding:2px 8px;
-     border-radius:99px;margin-left:6px;font-weight:600;vertical-align:middle}
+.check-row input{accent-color:var(--accent);width:16px;height:16px}
+button{padding:9px 20px;border:none;border-radius:8px;font-size:.82rem;font-weight:600;cursor:pointer;transition:all .15s;font-family:inherit}
+.btn-primary{background:var(--accent);color:#0b0f19}
+.btn-primary:hover{background:#7dd3fc;transform:translateY(-1px)}
+.btn-sm{padding:5px 12px;font-size:.75rem}
+.btn-danger{background:var(--red);color:#fff}
+.btn-danger:hover{background:#f87171}
+
+.endpoint{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px 14px;font-family:'Cascadia Code','Fira Code',monospace;font-size:.78rem;color:var(--accent);word-break:break-all}
+
+.help{background:var(--surface);border-left:3px solid var(--accent2);padding:12px 16px;margin:12px 0;border-radius:0 8px 8px 0;font-size:.82rem;line-height:1.7}
+.help code{background:var(--bg);padding:2px 6px;border-radius:4px;font-size:.78rem;color:var(--accent)}
+.warn-box{background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.25);border-radius:8px;padding:10px 14px;margin:8px 0;font-size:.8rem;color:var(--warn)}
+
+table{width:100%;border-collapse:collapse;font-size:.8rem}
+th{text-align:left;color:var(--muted);border-bottom:1px solid var(--border);padding:8px 6px;font-weight:600;font-size:.72rem;text-transform:uppercase;letter-spacing:.4px}
+td{padding:7px 6px;border-bottom:1px solid rgba(30,45,69,.5);font-variant-numeric:tabular-nums}
+tr:hover td{background:rgba(255,255,255,.01)}
+.mono{font-family:'Cascadia Code','Fira Code',monospace;font-size:.75rem}
+
 .alias-row{display:flex;gap:8px;margin-bottom:6px;align-items:center}
 .alias-row input{flex:1}
-.alias-row .arr{color:var(--accent);font-weight:bold;flex:0 0 auto}
-.alias-row .del{background:var(--red);color:#fff;padding:4px 10px;border-radius:6px;font-size:.8rem;cursor:pointer;border:none}
+.alias-row .arr{color:var(--accent);font-weight:bold;flex:0 0 auto;font-size:.9rem}
+.alias-row .del{background:var(--red);color:#fff;padding:4px 10px;border-radius:6px;font-size:.75rem;cursor:pointer;border:none}
+
+.toast{position:fixed;top:20px;right:20px;padding:12px 20px;border-radius:8px;font-weight:600;font-size:.85rem;opacity:0;transform:translateY(-10px);transition:all .3s;z-index:99;pointer-events:none}
+.toast.show{opacity:1;transform:translateY(0)}
+.toast.ok{background:var(--green);color:#fff}
+.toast.err{background:var(--red);color:#fff}
+
+.refresh-badge{font-size:.68rem;color:var(--muted);margin-left:8px;font-weight:400}
+
+.empty-state{text-align:center;padding:32px 16px;color:var(--muted);font-size:.85rem}
+
+@media(max-width:768px){
+  .stats-row{grid-template-columns:repeat(3,1fr)}
+  .row{grid-template-columns:1fr}
+  header{flex-direction:column;align-items:flex-start}
+}
+@media(max-width:480px){
+  .stats-row{grid-template-columns:repeat(2,1fr)}
+}
 </style>
 </head><body>
 <div class="container">
-  <h1>NIM to Claude API Proxy <span class="tag">v2</span></h1>
-  <p class="subtitle">NVIDIA NIM to Anthropic Claude Messages API Proxy - Claude Code Optimized</p>
+<header>
+  <h1>NIM to Claude Proxy</h1>
+  <div class="status">
+    <span class="dot" id="keyDot"></span>
+    <span id="keyStatus">Checking...</span>
+    <span class="refresh-badge">auto-refresh 15s</span>
+  </div>
+</header>
 
-  <div class="card">
-    <h2>Claude Code Setup</h2>
-    <div class="warn-box">
-      WARNING: ANTHROPIC_BASE_URL should end at port only, do NOT add /v1/messages
+<div class="stats-row">
+  <div class="stat-card"><div class="val accent" id="sReq">0</div><div class="lbl">Requests</div></div>
+  <div class="stat-card"><div class="val accent" id="sIn">0</div><div class="lbl">Input Tokens</div></div>
+  <div class="stat-card"><div class="val green"  id="sOut">0</div><div class="lbl">Output Tokens</div></div>
+  <div class="stat-card"><div class="val green"  id="sThink">0</div><div class="lbl">Thinking</div></div>
+  <div class="stat-card"><div class="val"       id="sQps">0</div><div class="lbl">QPM</div></div>
+</div>
+
+<div class="qps-row">
+  <span class="qps-label">Rate Limit</span>
+  <div class="qps-bar-wrap"><div class="qps-bar safe" id="qpsBar" style="width:0%"></div></div>
+  <span class="qps-val" id="qpsVal">0 / 40</span>
+</div>
+
+<div class="panel open" id="panelUsage">
+  <div class="panel-header" onclick="togglePanel('panelUsage')">
+    <h2>Recent Activity</h2><span class="arrow">&#9654;</span>
+  </div>
+  <div class="panel-body">
+    <table>
+      <thead><tr><th>Time</th><th>Request ID</th><th>Model</th><th>In</th><th>Out</th><th>Think</th><th>Total</th></tr></thead>
+      <tbody id="usageBody"></tbody>
+    </table>
+    <div style="text-align:right;margin-top:10px">
+      <button onclick="loadUsage()" class="btn-primary btn-sm">Refresh</button>
     </div>
+  </div>
+</div>
+
+<div class="panel" id="panelSetup">
+  <div class="panel-header" onclick="togglePanel('panelSetup')">
+    <h2>Claude Code Setup</h2><span class="arrow">&#9654;</span>
+  </div>
+  <div class="panel-body">
+    <div class="warn-box">WARNING: ANTHROPIC_BASE_URL must end at port only &mdash; do <b>NOT</b> append /v1/messages</div>
     <div class="help">
-      In <code>~/.claude/settings.json</code>:
-      <pre style="margin-top:8px;color:var(--text);white-space:pre-wrap">{
+      <div style="font-weight:600;margin-bottom:6px;font-size:.8rem">~/.claude/settings.json</div>
+      <pre style="color:var(--text);white-space:pre-wrap;font-family:'Cascadia Code',monospace;font-size:.78rem;line-height:1.8">{
   "env": {
     "ANTHROPIC_BASE_URL": "<span id="epBase" style="color:var(--accent)"></span>",
     "ANTHROPIC_AUTH_TOKEN": "<span id="epKey2" style="color:var(--accent2)"></span>",
@@ -882,31 +1072,27 @@ td{padding:6px;border-bottom:1px solid #1e293b}
 }</pre>
     </div>
     <div style="margin-top:10px">
-      <span style="color:var(--muted);font-size:.8rem">Messages Endpoint:</span>
+      <span style="color:var(--muted);font-size:.75rem;font-weight:600;text-transform:uppercase;letter-spacing:.4px">Endpoint</span>
       <div class="endpoint" id="epUrl"></div>
     </div>
   </div>
+</div>
 
-  <div class="card">
-    <h2>Server Config</h2>
+<div class="panel" id="panelConfig">
+  <div class="panel-header" onclick="togglePanel('panelConfig')">
+    <h2>Server Config</h2><span class="arrow">&#9654;</span>
+  </div>
+  <div class="panel-body">
     <form id="configForm">
-      <div class="field">
-        <label>NVIDIA API Base URL</label>
-        <input name="nvidia_base_url" id="f_base" placeholder="https://integrate.api.nvidia.com/v1">
-      </div>
-      <div class="field">
-        <label>NVIDIA API Key</label>
-        <input name="nvidia_api_key" id="f_key" type="password" placeholder="nvapi-xxx">
-      </div>
+      <div class="field"><label>NVIDIA API Base URL</label>
+        <input name="nvidia_base_url" id="f_base" placeholder="https://integrate.api.nvidia.com/v1"></div>
+      <div class="field"><label>NVIDIA API Key</label>
+        <input name="nvidia_api_key" id="f_key" type="password" placeholder="nvapi-xxx"></div>
       <div class="row">
-        <div class="field">
-          <label>Proxy API Key (for client auth)</label>
-          <input name="proxy_api_key" id="f_proxy" placeholder="sk-proxy-change-me">
-        </div>
-        <div class="field">
-          <label>Default Model</label>
-          <input name="default_model" id="f_model" placeholder="z-ai/glm-5.1">
-        </div>
+        <div class="field"><label>Proxy API Key</label>
+          <input name="proxy_api_key" id="f_proxy" placeholder="sk-proxy-change-me"></div>
+        <div class="field"><label>Default Model</label>
+          <input name="default_model" id="f_model" placeholder="z-ai/glm-5.1"></div>
       </div>
       <div class="row">
         <div class="field"><label>Max Tokens</label>
@@ -917,67 +1103,56 @@ td{padding:6px;border-bottom:1px solid #1e293b}
       <div class="row">
         <div class="field"><label>Top P</label>
           <input name="top_p" id="f_topp" type="number" step="0.1" value="1.0"></div>
-        <div class="field">
-          <label>&nbsp;</label>
-          <div class="check-row">
-            <input type="checkbox" id="f_think" name="enable_thinking" checked>
-            <label for="f_think" style="font-size:.9rem;color:var(--text)">Enable Thinking (default)</label>
-          </div>
-        </div>
+        <div class="field"><label>Rate Limit (req/min)</label>
+          <input name="rate_limit" id="f_ratelimit" type="number" value="40"></div>
+      </div>
+      <div class="check-row">
+        <input type="checkbox" id="f_think" name="enable_thinking" checked>
+        <label for="f_think" style="font-size:.85rem;color:var(--text);cursor:pointer">Enable Thinking (default)</label>
       </div>
       <button type="submit" class="btn-primary">Save Config</button>
     </form>
   </div>
-
-  <div class="card">
-    <h2>Model Aliases</h2>
-    <p style="color:var(--muted);font-size:.84rem;margin-bottom:12px">
-      Claude Code sends Claude model names (e.g. claude-sonnet-4-20250514).
-      Map them to NIM models here. Names containing "/" are treated as NIM-native and passed through.
-    </p>
-    <div id="aliasContainer"></div>
-    <button onclick="addAliasRow()" class="btn-primary" style="margin-top:8px;padding:6px 16px;font-size:.82rem">
-      + Add Alias</button>
-    <button onclick="saveAliases()" class="btn-primary" style="margin-top:8px;margin-left:8px;padding:6px 16px;font-size:.82rem">
-      Save Aliases</button>
-  </div>
-
-  <div class="card">
-    <h2>Token Usage (Estimated)</h2>
-    <div class="stat-grid">
-      <div class="stat-box"><div class="num" id="sReq">0</div><div class="lbl">Requests</div></div>
-      <div class="stat-box"><div class="num" id="sIn">0</div><div class="lbl">Input Tokens</div></div>
-      <div class="stat-box"><div class="num" id="sOut">0</div><div class="lbl">Output Tokens</div></div>
-      <div class="stat-box"><div class="num" id="sThink">0</div><div class="lbl">Thinking Tokens</div></div>
-    </div>
-    <table>
-      <thead><tr><th>Time</th><th>Request ID</th><th>Model</th><th>In</th><th>Out</th><th>Think</th><th>Total</th></tr></thead>
-      <tbody id="usageBody"></tbody>
-    </table>
-    <div style="text-align:right;margin-top:8px">
-      <button onclick="loadUsage()" class="btn-primary" style="padding:6px 16px;font-size:.8rem">Refresh</button>
-    </div>
-  </div>
 </div>
 
-<div class="toast" id="toast">Config saved</div>
+<div class="panel" id="panelAliases">
+  <div class="panel-header" onclick="togglePanel('panelAliases')">
+    <h2>Model Aliases</h2><span class="arrow">&#9654;</span>
+  </div>
+  <div class="panel-body">
+    <p style="color:var(--muted);font-size:.8rem;margin-bottom:12px">
+      Map Claude model names (e.g. claude-sonnet-4-20250514) to NIM models.
+      Names containing "/" are treated as NIM-native and passed through.
+    </p>
+    <div id="aliasContainer"></div>
+    <button onclick="addAliasRow()" class="btn-primary btn-sm" style="margin-top:8px">+ Add Alias</button>
+    <button onclick="saveAliases()" class="btn-primary btn-sm" style="margin-top:8px;margin-left:6px">Save</button>
+  </div>
+</div>
+</div>
+
+<div class="toast" id="toast"></div>
 
 <script>
 const $=s=>document.querySelector(s);
 let currentAliases={};
 
+function togglePanel(id){
+  document.getElementById(id).classList.toggle('open');
+}
+
 function toast(msg,ok=true){
   const t=$('#toast');t.textContent=msg;
-  t.style.background=ok?'var(--green)':'var(--red)';
-  t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2000);
+  t.className='toast '+(ok?'ok':'err')+' show';
+  setTimeout(()=>t.classList.remove('show'),2000);
 }
 
 function addAliasRow(from='',to=''){
   const c=$('#aliasContainer');
   const d=document.createElement('div');d.className='alias-row';
-  d.innerHTML=`<input class="af" placeholder="claude-sonnet-4-20250514" value="${from}" style="font-size:.82rem">
+  d.innerHTML=`<input class="af" placeholder="claude-sonnet-4-20250514" value="${from}" style="font-size:.8rem">
     <span class="arr">&rarr;</span>
-    <input class="at" placeholder="z-ai/glm-5.1" value="${to}" style="font-size:.82rem">
+    <input class="at" placeholder="z-ai/glm-5.1" value="${to}" style="font-size:.8rem">
     <button class="del" onclick="this.parentElement.remove()">X</button>`;
   c.appendChild(d);
 }
@@ -1009,6 +1184,7 @@ async function loadConfig(){
   $('#f_maxtok').value=c.max_tokens||16384;
   $('#f_temp').value=c.temperature||1;
   $('#f_topp').value=c.top_p||1;
+  $('#f_ratelimit').value=c.rate_limit||40;
   $('#f_think').checked=!!c.enable_thinking;
   const base=location.origin;
   $('#epBase').textContent=base;
@@ -1018,6 +1194,9 @@ async function loadConfig(){
   $('#epMdl').textContent=mdl;
   $('#epMdl2').textContent=mdl;
   $('#epMdl3').textContent=mdl;
+  const keySet=c.nvidia_api_key&&c.nvidia_api_key.length>4;
+  $('#keyDot').className='dot '+(keySet?'on':'off');
+  $('#keyStatus').textContent=keySet?'API Key configured':'API Key not set';
   currentAliases=c.model_aliases||{};
   const ac=$('#aliasContainer');ac.innerHTML='';
   Object.entries(currentAliases).forEach(([f,t])=>addAliasRow(f,t));
@@ -1039,12 +1218,17 @@ async function loadUsage(){
   $('#sIn').textContent=u.total.input.toLocaleString();
   $('#sOut').textContent=u.total.output.toLocaleString();
   $('#sThink').textContent=u.total.thinking.toLocaleString();
+  $('#sQps').textContent=u.qps;
+  const pct=u.max_qps>0?Math.min(100,(u.qps/u.max_qps)*100):0;
+  const bar=$('#qpsBar');bar.style.width=pct+'%';
+  bar.className='qps-bar '+(pct>=90?'danger':pct>=70?'warn':'safe');
+  $('#qpsVal').textContent=u.qps+' / '+u.max_qps;
   const rows=u.recent.reverse().map(e=>
     `<tr><td class="mono">${e.ts}</td><td class="mono">${e.rid.slice(0,12)}...</td>
      <td>${e.model}</td><td>${e.in}</td><td>${e.out}</td><td>${e.think}</td>
      <td style="font-weight:600">${e.total}</td></tr>`).join('');
   $('#usageBody').innerHTML=rows||
-    '<tr><td colspan="7" style="text-align:center;color:var(--muted)">No data yet</td></tr>';
+    '<tr><td colspan="7"><div class="empty-state">No requests yet</div></td></tr>';
 }
 
 loadConfig();loadUsage();setInterval(loadUsage,15000);
