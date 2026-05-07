@@ -73,6 +73,30 @@ def _fetch_nvidia_models():
 
     if not api_key:
         logger.warning("No API key, using fallback models")
+        return _FALLBACK_MODELS
+
+    try:
+        import requests as _r
+        resp = _r.get(f"{base_url}/models", headers={
+            "Authorization": f"Bearer {api_key}",
+        }, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            models = []
+            for m in data.get("data", []):
+                mid = m.get("id", "")
+                if mid:
+                    models.append(mid)
+            if models:
+                _MODEL_CACHE["models"] = models
+                _MODEL_CACHE["ts"] = now
+                logger.info(f"{_C(32)}Fetched {len(models)} models from NVIDIA{_RST}")
+                return models
+    except Exception as e:
+        logger.warning(f"{_C(33)}Failed to fetch models from NVIDIA: {e}{_RST}")
+
+    if _MODEL_CACHE["models"]:
+        return _MODEL_CACHE["models"]
     return _FALLBACK_MODELS
 
 
@@ -686,6 +710,13 @@ def handle_messages():
         system_len = len(json.dumps(sys_val, ensure_ascii=False)) if isinstance(sys_val, list) else len(str(sys_val))
     thinking_cfg = body.get("thinking", {})
 
+    if "/" in model and _MODEL_CACHE["models"]:
+        if model not in _MODEL_CACHE["models"]:
+            logger.warning(f"{_C(33)}Unknown model: {model}{_RST}")
+            return jsonify({"type": "error", "error": {"type": "invalid_request_error",
+                            "message": f"Unknown model: {model}. Check available models at /api/models"
+                            }}), 400
+
     logger.info(
         f"{_C(35)}-> REQ{_RST} | {rid[:16]}... | "
         f"model={_C(33)}{raw_model}{_RST}->{_C(32)}{model}{_RST} | "
@@ -838,6 +869,96 @@ def messages_no_prefix():
     return handle_messages()
 
 
+def _openai_passthrough():
+    if not _auth_check():
+        return jsonify({"type": "error", "error": {"type": "authentication_error",
+                        "message": "Invalid API key"}}), 401
+
+    allowed, current, limit = _check_rate_limit()
+    if not allowed:
+        logger.warning(f"{_C(33)}Rate limit: {current}/{limit} per minute{_RST}")
+        return jsonify({"error": {"message": f"Rate limit exceeded: {current}/{limit} per minute", "type": "rate_limit_error", "code": "rate_limit_exceeded"}}), 429
+
+    body = request.get_json(force=True)
+    model = body.get("model", "")
+    is_stream = body.get("stream", False)
+    rid = f"chat_{uuid.uuid4().hex[:24]}"
+
+    if "/" in model and _MODEL_CACHE["models"]:
+        if model not in _MODEL_CACHE["models"]:
+            logger.warning(f"{_C(33)}Unknown model: {model}{_RST}")
+            return jsonify({"error": {"message": f"Unknown model: {model}", "type": "invalid_request_error", "code": "model_not_found"}}), 400
+
+    logger.info(
+        f"{_C(35)}-> OAI{_RST} | {rid[:16]}... | "
+        f"model={_C(32)}{model}{_RST} | stream={is_stream} | msgs={len(body.get('messages', []))}"
+    )
+
+    with CONFIG_LOCK:
+        base_url = CONFIG["nvidia_base_url"].rstrip("/")
+        api_key = CONFIG["nvidia_api_key"]
+
+    if not api_key:
+        return jsonify({"error": {"message": "API key not configured", "type": "server_error"}}), 500
+
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+    target_url = f"{base_url}/chat/completions"
+
+    import requests as http_req
+    RETRYABLE = {502, 503, 504}
+    MAX_RETRIES = 3
+    upstream = None
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            upstream = http_req.post(target_url, headers=headers, json=body, stream=is_stream, timeout=(15, 120))
+            if upstream.status_code in RETRYABLE and attempt < MAX_RETRIES:
+                upstream.close()
+                time.sleep(2 ** attempt)
+                continue
+            break
+        except (http_req.exceptions.Timeout, Exception):
+            if attempt < MAX_RETRIES:
+                time.sleep(2 ** attempt)
+                continue
+            return jsonify({"error": {"message": "Upstream unavailable", "type": "server_error"}}), 502
+
+    if upstream is None or upstream.status_code != 200:
+        status = upstream.status_code if upstream else 502
+        try:
+            err = upstream.json()
+        except Exception:
+            err = {"message": upstream.text[:500] if upstream else "no response"}
+        logger.error(f"{_C(31)}X OAI upstream {status}{_RST}")
+        return jsonify(err), status
+
+    logger.info(f"{_C(32)}OK OAI upstream 200{_RST} | stream={is_stream}")
+
+    if is_stream:
+        def stream_passthrough():
+            try:
+                for chunk in upstream.iter_content(chunk_size=8192, decode_unicode=True):
+                    if chunk:
+                        yield chunk
+            finally:
+                upstream.close()
+        return Response(stream_passthrough(), mimetype="text/event-stream",
+                        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+                                 "x-request-id": rid})
+
+    try:
+        result = upstream.json()
+    except Exception:
+        return jsonify({"error": {"message": "Invalid JSON from upstream", "type": "server_error"}}), 502
+    resp = jsonify(result)
+    resp.headers["x-request-id"] = rid
+    return resp
+
+
+@app.route("/v1/chat/completions", methods=["POST"])
+def oai_completions():
+    return _openai_passthrough()
+
+
 @app.route("/v1/models", methods=["GET"])
 def list_models():
     models = _fetch_nvidia_models()
@@ -918,13 +1039,35 @@ def health():
     })
 
 
+@app.route("/api/models", methods=["GET"])
+def api_models():
+    models = _fetch_nvidia_models()
+    q = request.args.get("q", "").lower()
+    page = int(request.args.get("page", 1))
+    per_page = int(request.args.get("per_page", 200))
+    result = [m for m in models if q in m.lower()] if q else list(models)
+    total = len(result)
+    start = (page - 1) * per_page
+    result = result[start:start + per_page]
+    return jsonify({"models": result, "total": total, "cached": bool(_MODEL_CACHE["models"])})
+
+
 WEB_PAGE = r'''<!DOCTYPE html>
-<html lang="zh-CN"><head>
+<html lang="zh-CN" data-theme="dark"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>NIM to Claude Proxy</title>
 <style>
-:root{--bg:#0b0f19;--surface:#131a2b;--card:#182035;--accent:#38bdf8;--accent2:#818cf8;
-      --text:#e4e8f0;--muted:#7b89a0;--border:#1e2d45;--green:#22c55e;--red:#ef4444;--warn:#f59e0b;--orange:#fb923c}
+html{transition:background .3s,color .3s}
+html[data-theme="dark"]{
+  --bg:#0b0f19;--surface:#131a2b;--card:#182035;--accent:#38bdf8;--accent2:#818cf8;
+  --text:#e4e8f0;--muted:#7b89a0;--border:#1e2d45;--green:#22c55e;--red:#ef4444;
+  --warn:#f59e0b;--orange:#fb923c;--input-bg:#0b0f19;--hover:rgba(255,255,255,.03)
+}
+html[data-theme="light"]{
+  --bg:#f5f6fa;--surface:#fff;--card:#fff;--accent:#0284c7;--accent2:#6366f1;
+  --text:#1e293b;--muted:#64748b;--border:#e2e8f0;--green:#16a34a;--red:#dc2626;
+  --warn:#d97706;--orange:#ea580c;--input-bg:#f8fafc;--hover:rgba(0,0,0,.02)
+}
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:'Inter','Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
 .container{max-width:1060px;margin:0 auto;padding:24px 20px 40px}
@@ -935,6 +1078,9 @@ header .status{display:flex;align-items:center;gap:6px;font-size:.78rem;color:va
 header .dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex-shrink:0}
 header .dot.on{background:var(--green);box-shadow:0 0 6px var(--green)}
 header .dot.off{background:var(--red);box-shadow:0 0 6px var(--red)}
+
+.theme-btn{background:var(--surface);border:1px solid var(--border);color:var(--text);width:34px;height:34px;border-radius:8px;cursor:pointer;font-size:1rem;display:flex;align-items:center;justify-content:center;transition:all .2s;flex-shrink:0}
+.theme-btn:hover{border-color:var(--accent);background:var(--hover)}
 
 .stats-row{display:grid;grid-template-columns:repeat(5,1fr);gap:14px;margin-bottom:24px}
 .stat-card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:20px 16px;text-align:center;transition:border-color .2s,transform .15s}
@@ -957,7 +1103,7 @@ header .dot.off{background:var(--red);box-shadow:0 0 6px var(--red)}
 
 .panel{background:var(--card);border:1px solid var(--border);border-radius:12px;margin-bottom:16px;overflow:hidden}
 .panel-header{padding:14px 18px;cursor:pointer;display:flex;align-items:center;justify-content:space-between;user-select:none;transition:background .15s}
-.panel-header:hover{background:rgba(255,255,255,.02)}
+.panel-header:hover{background:var(--hover)}
 .panel-header h2{font-size:.95rem;font-weight:600;color:var(--text)}
 .panel-header .arrow{font-size:.7rem;color:var(--muted);transition:transform .25s}
 .panel.open .panel-header .arrow{transform:rotate(90deg)}
@@ -967,7 +1113,7 @@ header .dot.off{background:var(--red);box-shadow:0 0 6px var(--red)}
 .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 .field{margin-bottom:12px}
 .field label{display:block;font-size:.72rem;color:var(--muted);margin-bottom:4px;text-transform:uppercase;letter-spacing:.4px;font-weight:600}
-.field input,.field select{width:100%;padding:9px 12px;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:.85rem;outline:none;transition:border .2s}
+.field input,.field select{width:100%;padding:9px 12px;background:var(--input-bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:.85rem;outline:none;transition:border .2s}
 .field input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(56,189,248,.1)}
 .check-row{display:flex;align-items:center;gap:8px;margin:8px 0}
 .check-row input{accent-color:var(--accent);width:16px;height:16px}
@@ -978,16 +1124,16 @@ button{padding:9px 20px;border:none;border-radius:8px;font-size:.82rem;font-weig
 .btn-danger{background:var(--red);color:#fff}
 .btn-danger:hover{background:#f87171}
 
-.endpoint{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px 14px;font-family:'Cascadia Code','Fira Code',monospace;font-size:.78rem;color:var(--accent);word-break:break-all}
+.endpoint{background:var(--input-bg);border:1px solid var(--border);border-radius:8px;padding:10px 14px;font-family:'Cascadia Code','Fira Code',monospace;font-size:.78rem;color:var(--accent);word-break:break-all}
 
 .help{background:var(--surface);border-left:3px solid var(--accent2);padding:12px 16px;margin:12px 0;border-radius:0 8px 8px 0;font-size:.82rem;line-height:1.7}
-.help code{background:var(--bg);padding:2px 6px;border-radius:4px;font-size:.78rem;color:var(--accent)}
+.help code{background:var(--input-bg);padding:2px 6px;border-radius:4px;font-size:.78rem;color:var(--accent)}
 .warn-box{background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.25);border-radius:8px;padding:10px 14px;margin:8px 0;font-size:.8rem;color:var(--warn)}
 
 table{width:100%;border-collapse:collapse;font-size:.8rem}
 th{text-align:left;color:var(--muted);border-bottom:1px solid var(--border);padding:8px 6px;font-weight:600;font-size:.72rem;text-transform:uppercase;letter-spacing:.4px}
-td{padding:7px 6px;border-bottom:1px solid rgba(30,45,69,.5);font-variant-numeric:tabular-nums}
-tr:hover td{background:rgba(255,255,255,.01)}
+td{padding:7px 6px;border-bottom:1px solid var(--border);font-variant-numeric:tabular-nums}
+tr:hover td{background:var(--hover)}
 .mono{font-family:'Cascadia Code','Fira Code',monospace;font-size:.75rem}
 
 .alias-row{display:flex;gap:8px;margin-bottom:6px;align-items:center}
@@ -1004,6 +1150,19 @@ tr:hover td{background:rgba(255,255,255,.01)}
 
 .empty-state{text-align:center;padding:32px 16px;color:var(--muted);font-size:.85rem}
 
+.search-box{width:100%;padding:9px 12px;background:var(--input-bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:.85rem;outline:none;margin-bottom:12px;transition:border .2s}
+.search-box:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(56,189,248,.1)}
+
+.model-count{font-size:.75rem;color:var(--muted);margin-bottom:8px}
+
+.model-row{cursor:pointer;transition:background .15s}
+.model-row.copied{animation:flash .6s ease}
+
+@keyframes flash{
+  0%,100%{background:transparent}
+  50%{background:rgba(34,197,94,.12)}
+}
+
 @media(max-width:768px){
   .stats-row{grid-template-columns:repeat(3,1fr)}
   .row{grid-template-columns:1fr}
@@ -1017,10 +1176,13 @@ tr:hover td{background:rgba(255,255,255,.01)}
 <div class="container">
 <header>
   <h1>NIM to Claude Proxy</h1>
-  <div class="status">
-    <span class="dot" id="keyDot"></span>
-    <span id="keyStatus">Checking...</span>
-    <span class="refresh-badge">auto-refresh 15s</span>
+  <div style="display:flex;align-items:center;gap:12px">
+    <div class="status">
+      <span class="dot" id="keyDot"></span>
+      <span id="keyStatus">Checking...</span>
+      <span class="refresh-badge">auto-refresh 15s</span>
+    </div>
+    <button class="theme-btn" id="themeBtn" onclick="toggleTheme()" title="Toggle theme">&#9728;&#65039;</button>
   </div>
 </header>
 
@@ -1053,6 +1215,22 @@ tr:hover td{background:rgba(255,255,255,.01)}
   </div>
 </div>
 
+<div class="panel" id="panelModels">
+  <div class="panel-header" onclick="togglePanel('panelModels')">
+    <h2>Available Models (from NVIDIA)</h2><span class="arrow">&#9654;</span>
+  </div>
+  <div class="panel-body">
+    <input class="search-box" id="modelSearch" type="text" placeholder="Search models..." oninput="filterModels()">
+    <div class="model-count" id="modelCount"></div>
+    <div style="max-height:400px;overflow-y:auto">
+      <table>
+        <thead><tr><th>Model ID</th><th>Provider</th></tr></thead>
+        <tbody id="modelsBody"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
 <div class="panel" id="panelSetup">
   <div class="panel-header" onclick="togglePanel('panelSetup')">
     <h2>Claude Code Setup</h2><span class="arrow">&#9654;</span>
@@ -1072,8 +1250,12 @@ tr:hover td{background:rgba(255,255,255,.01)}
 }</pre>
     </div>
     <div style="margin-top:10px">
-      <span style="color:var(--muted);font-size:.75rem;font-weight:600;text-transform:uppercase;letter-spacing:.4px">Endpoint</span>
+      <span style="color:var(--muted);font-size:.75rem;font-weight:600;text-transform:uppercase;letter-spacing:.4px">Anthropic Endpoint (Claude Code)</span>
       <div class="endpoint" id="epUrl"></div>
+    </div>
+    <div style="margin-top:10px">
+      <span style="color:var(--muted);font-size:.75rem;font-weight:600;text-transform:uppercase;letter-spacing:.4px">OpenAI Endpoint</span>
+      <div class="endpoint" id="epOaiUrl"></div>
     </div>
   </div>
 </div>
@@ -1136,9 +1318,33 @@ tr:hover td{background:rgba(255,255,255,.01)}
 <script>
 const $=s=>document.querySelector(s);
 let currentAliases={};
+let allModels=[];
+
+(function(){
+  const saved=localStorage.getItem('theme')||'dark';
+  document.documentElement.setAttribute('data-theme',saved);
+  updateThemeIcon();
+})();
+
+function toggleTheme(){
+  const html=document.documentElement;
+  const cur=html.getAttribute('data-theme');
+  const next=cur==='dark'?'light':'dark';
+  html.setAttribute('data-theme',next);
+  localStorage.setItem('theme',next);
+  updateThemeIcon();
+}
+
+function updateThemeIcon(){
+  const btn=document.getElementById('themeBtn');
+  const theme=document.documentElement.getAttribute('data-theme')||'dark';
+  btn.innerHTML=theme==='dark'?'&#9728;&#65039;':'&#127769;';
+}
 
 function togglePanel(id){
-  document.getElementById(id).classList.toggle('open');
+  const panel=document.getElementById(id);
+  panel.classList.toggle('open');
+  if(id==='panelModels'&&panel.classList.contains('open')){loadModels();}
 }
 
 function toast(msg,ok=true){
@@ -1189,6 +1395,7 @@ async function loadConfig(){
   const base=location.origin;
   $('#epBase').textContent=base;
   $('#epUrl').textContent=base+'/v1/messages';
+  $('#epOaiUrl').textContent=base+'/v1/chat/completions';
   $('#epKey2').textContent=c.proxy_api_key||'(none)';
   const mdl=c.default_model||'z-ai/glm-5.1';
   $('#epMdl').textContent=mdl;
@@ -1229,6 +1436,41 @@ async function loadUsage(){
      <td style="font-weight:600">${e.total}</td></tr>`).join('');
   $('#usageBody').innerHTML=rows||
     '<tr><td colspan="7"><div class="empty-state">No requests yet</div></td></tr>';
+}
+
+async function loadModels(){
+  try{
+    const r=await fetch('/api/models');const d=await r.json();
+    allModels=d.models||[];
+    renderModels(allModels,d.total||allModels.length);
+  }catch(e){
+    $('#modelsBody').innerHTML='<tr><td colspan="2"><div class="empty-state">Failed to load models</div></td></tr>';
+    $('#modelCount').textContent='';
+  }
+}
+
+function filterModels(){
+  const q=document.getElementById('modelSearch').value.toLowerCase();
+  const filtered=q?allModels.filter(m=>m.toLowerCase().includes(q)):allModels;
+  renderModels(filtered,allModels.length);
+}
+
+function renderModels(models,total){
+  document.getElementById('modelCount').textContent=models.length+' / '+total+' models';
+  const rows=models.map(m=>{
+    const prov=m.split('/')[0];
+    return '<tr class="model-row" onclick="copyModel(\''+m.replace(/'/g,"\\'")+'\',this)" title="Click to copy"><td class="mono">'+m+'</td><td style="color:var(--muted)">'+prov+'</td></tr>';
+  }).join('');
+  document.getElementById('modelsBody').innerHTML=rows||
+    '<tr><td colspan="2"><div class="empty-state">No models found</div></td></tr>';
+}
+
+function copyModel(id,row){
+  navigator.clipboard.writeText(id).then(()=>{
+    row.classList.add('copied');
+    setTimeout(()=>row.classList.remove('copied'),600);
+    toast('Copied: '+id);
+  }).catch(()=>toast('Copy failed',false));
 }
 
 loadConfig();loadUsage();setInterval(loadUsage,15000);
@@ -1285,6 +1527,9 @@ if __name__ == "__main__":
   Proxy API Key:       {CONFIG['proxy_api_key'][:20]}
 ======================================================{_RST}
 """)
+
+    if has_key:
+        _fetch_nvidia_models()
 
     if debug_mode:
         app.run(host=host, port=port, debug=False, threaded=True)
